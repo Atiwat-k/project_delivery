@@ -1,9 +1,16 @@
+import 'dart:async';
 import 'dart:developer';
+import 'dart:ffi';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:delivery/config/config.dart';
 
 import 'package:delivery/login.dart';
+import 'package:delivery/models/response/shipments_receiver_Respone.dart';
+import 'package:delivery/models/response/shipments_sender_Respone.dart';
 import 'package:delivery/models/response/user_get_all_responsse.dart';
 import 'package:delivery/models/response/user_get_responsse.dart';
+import 'package:delivery/user/map.dart';
+import 'package:delivery/user/shipments.dart';
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:http/http.dart' as http;
@@ -22,14 +29,23 @@ class _UserPageState extends State<UserPage> {
   String url = '';
   late UserGetResponsse userGetResponsse;
   late Future<void> loadData;
+  late Future<void> loadshipments;
   String _searchPhone = '';
   List<UserGetAllResponsse> _searchResults = [];
+  TextEditingController nameCtl = TextEditingController();
+  List<ShipmentsSenderRespone> shipmentsSenderRespone = [];
+  List<ShipmentsReceiverRespone> shipmentsreceiverRespone = [];
   bool _isLoading = false;
+  var db = FirebaseFirestore.instance;
+  List<Map<String, dynamic>> shipmentsDetails = [];
+  late StreamSubscription listener;
+  String s_id = "";
 
   @override
   void initState() {
     super.initState();
     loadData = _loadDataAsync();
+    loadshipments = _fetchShipments();
   }
 
   Future<void> _loadDataAsync() async {
@@ -40,10 +56,19 @@ class _UserPageState extends State<UserPage> {
     userGetResponsse = userGetResponsseFromJson(res.body);
   }
 
-  void _onIconButtonPressed(int index) {
+  void _onIconButtonPressed(int index) async {
     setState(() {
       _selectedIndex = index;
     });
+
+    // Reload shipments if the delivery section is selected
+    if (_selectedIndex == 1) {
+      await _fetchShipments(); // Fetch shipments again and wait for it to complete
+    }
+
+    if (_selectedIndex == 2) {
+      await _fetchReceive();
+    }
   }
 
   @override
@@ -284,15 +309,25 @@ class _UserPageState extends State<UserPage> {
                             // จัดให้ปุ่มอยู่กลาง
                             child: ElevatedButton(
                               onPressed: () {
-                                // ฟังก์ชันที่ต้องการเมื่อปุ่มถูกกด
+                                // Navigate to ShipmentScreen with uid when button is pressed
+                                Navigator.push(
+                                  context,
+                                  MaterialPageRoute(
+                                    builder: (context) => ShipmentScreen(
+                                        userGetResponsse.uid,
+                                        userGetResponsse.gps,
+                                        user.uid,
+                                        user.gps), // Pass uid here
+                                  ),
+                                );
                               },
                               style: ElevatedButton.styleFrom(
                                 backgroundColor:
                                     Colors.green, // สีพื้นหลังของปุ่ม
                                 padding: const EdgeInsets.symmetric(
-                                    vertical: 10.0,
-                                    horizontal:
-                                        60.0), // ตั้งค่าระยะห่างภายในปุ่ม
+                                  vertical: 10.0,
+                                  horizontal: 60.0,
+                                ), // ตั้งค่าระยะห่างภายในปุ่ม
                               ),
                               child: const Text(
                                 'เลือก',
@@ -314,8 +349,352 @@ class _UserPageState extends State<UserPage> {
     );
   }
 
-  Widget _buildDeliverySection() => Center(child: Text("Delivery Section"));
-  Widget _buildReceiveSection() => Center(child: Text("Receive Section"));
+  Future<void> _fetchShipments() async {
+    setState(() => _isLoading = true);
+    shipmentsDetails.clear(); // ล้างข้อมูลก่อนเริ่มดึงใหม่
+
+    try {
+      // เรียกใช้งาน API เพื่อดึงข้อมูลการจัดส่ง
+      var config = await Configguration.getConfig();
+      url = config['apiEndpoint'];
+      var res =
+          await http.get(Uri.parse('$url/shipments/sender/${widget.uid}'));
+
+      if (res.statusCode == 200) {
+        shipmentsSenderRespone = shipmentsSenderResponeFromJson(res.body);
+        log('Fetched shipments successfully');
+
+        // สมัครรับข้อมูลแบบเรียลไทม์จาก Firestore สำหรับแต่ละ shipmentId
+        for (var shipment in shipmentsSenderRespone) {
+          var shipmentId = shipment.shipmentId;
+
+          FirebaseFirestore.instance
+              .collection('shipments')
+              .doc(shipmentId.toString())
+              .snapshots() // สมัครรับข้อมูลเรียลไทม์
+              .listen((snapshot) {
+            if (snapshot.exists) {
+              var data = snapshot.data();
+              log('Shipment ID: ${data!['shipment_id'].toString()}');
+              log('Sender ID: ${data['sender_id'].toString()}');
+              log('Status: ${data['status'].toString()}');
+
+              // ค้นหา shipment ในรายการและอัปเดตสถานะหรือเพิ่มใหม่
+              var existingIndex = shipmentsDetails.indexWhere(
+                  (element) => element['shipment_id'] == shipmentId);
+
+              if (existingIndex >= 0) {
+                // อัปเดตรายการที่มีอยู่
+                shipmentsDetails[existingIndex] = data;
+              } else {
+                // เพิ่มรายการใหม่
+                shipmentsDetails.add(data);
+              }
+
+              // อัปเดต UI
+              setState(() {});
+            } else {
+              log("Document does not exist");
+            }
+          });
+        }
+      } else {
+        _showSnackBar('Failed to load shipments');
+      }
+    } catch (error) {
+      log('Error fetching shipments: $error');
+      _showSnackBar('Error fetching shipments: $error');
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  Widget _buildDeliverySection() {
+    // Display a loading indicator while fetching data
+    if (_isLoading) {
+      return Center(child: CircularProgressIndicator());
+    }
+
+    // Handle case where no shipments are found
+    if (shipmentsSenderRespone.isEmpty) {
+      return Center(child: Text('No deliveries available'));
+    }
+
+    // Build the list of deliveries
+    return ListView.builder(
+      itemCount: shipmentsSenderRespone.length,
+      itemBuilder: (context, index) {
+        final delivery = shipmentsSenderRespone[index];
+        final shipmentId = delivery.shipmentId;
+
+        // ค้นหาข้อมูลสถานะที่ตรงกันจาก shipmentsDetails
+        final statusData = shipmentsDetails.firstWhere(
+          (element) => element['shipment_id'] == shipmentId,
+          orElse: () => {'status': 0}, // ค่าเริ่มต้นถ้าไม่พบ
+        );
+        final status = statusData['status'];
+
+        return Container(
+          width: double.infinity,
+          height: 160,
+          margin: const EdgeInsets.symmetric(vertical: 5.0, horizontal: 5.0),
+          child: Card(
+            color: Colors.white,
+            elevation: 10,
+            child: Stack(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.all(10.0),
+                  child: Row(
+                    children: [
+                      Align(
+                        alignment: Alignment.center,
+                        child: CircleAvatar(
+                          radius: 60,
+                          backgroundImage: NetworkImage(delivery.receiverImage),
+                        ),
+                      ),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(5, 45, 0, 0),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    "ชื่อ: ${delivery.receiverName}",
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 4),
+                                  Text("เบอร์โทร: ${delivery.receiverPhone}"),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Positioned(
+                  top: 10,
+                  right: 10,
+                  child: Text(
+                    _getStatusText(status),
+                    style: TextStyle(
+                      color: _getStatusColor(status),
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+// Function to convert status code to status text
+  String _getStatusText(int status) {
+    switch (status) {
+      case 1:
+        return "รอไรเดอร์รับสินค้า"; // Status 1
+      case 2:
+        return "ไรเดอร์รับงาน"; // Status 2
+      case 3:
+        return "ไรเดอร์รับสินค้าแล้ว"; // Status 3
+      default:
+        return "ไม่ทราบสถานะ"; // Default case
+    }
+  }
+
+// Function to get the color based on status
+  Color _getStatusColor(int status) {
+    switch (status) {
+      case 1:
+        return const Color.fromARGB(255, 255, 0, 0); // Status 1 - Green
+      case 2:
+        return Colors.orange; // Status 2 - Orange
+      case 3:
+        return Colors.green; // Status 3 - Green
+      default:
+        return Colors.black; // Default color
+    }
+  }
+
+  Future<void> _fetchReceive() async {
+    setState(() => _isLoading = true);
+    shipmentsDetails.clear(); // ล้างข้อมูลก่อนเริ่มดึงใหม่
+
+    try {
+      // เรียกใช้งาน API เพื่อดึงข้อมูลการจัดส่ง
+      var config = await Configguration.getConfig();
+      url = config['apiEndpoint'];
+      var res = await http.get(Uri.parse(
+          '$url/shipments/receiver/${widget.uid}')); // ดึงข้อมูล receiver ตาม uid
+
+      if (res.statusCode == 200) {
+        shipmentsreceiverRespone = shipmentsReceiverResponeFromJson(res.body);
+        log('Fetched shipments successfully');
+
+        // สมัครรับข้อมูลแบบเรียลไทม์จาก Firestore สำหรับแต่ละ shipmentId
+        for (var shipment in shipmentsreceiverRespone) {
+          var shipmentId = shipment.shipmentId;
+
+          FirebaseFirestore.instance
+              .collection('shipments')
+              .doc(shipmentId.toString())
+              .snapshots() // สมัครรับข้อมูลเรียลไทม์
+              .listen((snapshot) {
+            if (snapshot.exists) {
+              var data = snapshot.data();
+              log('shipments ID: ${data!['shipment_id'].toString()}');
+              log('Receiver ID: ${data!['receiver_id'].toString()}');
+              log('Sender ID: ${data['sender_id'].toString()}');
+              log('Status: ${data['status'].toString()}');
+
+              // ค้นหา shipment ในรายการและอัปเดตสถานะหรือเพิ่มใหม่
+              var existingIndex = shipmentsDetails.indexWhere((element) =>
+                  element['receiver_id'] ==
+                  data['receiver_id']); // ตรงกับ receiver_id
+
+              if (existingIndex >= 0) {
+                // อัปเดตรายการที่มีอยู่
+                shipmentsDetails[existingIndex] = data;
+              } else {
+                // เพิ่มรายการใหม่
+                shipmentsDetails.add(data);
+              }
+
+              // อัปเดต UI
+              setState(() {});
+            } else {
+              log("Document does not exist");
+            }
+          });
+        }
+      } else {
+        _showSnackBar('Failed to load shipments');
+      }
+    } catch (error) {
+      log('Error fetching shipments: $error');
+      _showSnackBar('Error fetching shipments: $error');
+    } finally {
+      setState(() => _isLoading = false);
+    }
+  }
+
+  Widget _buildReceiveSection() {
+    // Display a loading indicator while fetching data
+    if (_isLoading) {
+      return Center(child: CircularProgressIndicator());
+    }
+
+    // Handle case where no shipments are found
+    if (shipmentsreceiverRespone.isEmpty) {
+      return Center(child: Text('No deliveries available'));
+    }
+
+    // Build the list of deliveries
+    return ListView.builder(
+      itemCount: shipmentsreceiverRespone.length,
+      itemBuilder: (context, index) {
+        final delivery = shipmentsreceiverRespone[index];
+        final shipmentId = delivery.shipmentId;
+        final pickupLocation = delivery.receiverGps;
+        final deliveryLocation = delivery.senderGps;
+
+        // ค้นหาข้อมูลสถานะที่ตรงกันจาก shipmentsDetails
+        final statusData = shipmentsDetails.firstWhere(
+          (element) => element['shipment_id'] == shipmentId,
+          orElse: () => {'status': 0}, // ค่าเริ่มต้นถ้าไม่พบ
+        );
+        final status = statusData['status'];
+
+        return GestureDetector(
+          onTap: () {
+            // Navigate to MapScreen when tapped
+            Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (context) => MapScreen(
+                  shipmentId: shipmentId,
+                  pickupLocation: pickupLocation,
+                  deliveryLocation: deliveryLocation,
+                ),
+              ),
+            );
+          },
+          child: Container(
+            width: double.infinity,
+            height: 160,
+            margin: const EdgeInsets.symmetric(vertical: 5.0, horizontal: 5.0),
+            child: Card(
+              color: Colors.white,
+              elevation: 10,
+              child: Stack(
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.all(10.0),
+                    child: Row(
+                      children: [
+                        Align(
+                          alignment: Alignment.center,
+                          child: CircleAvatar(
+                            radius: 60,
+                            backgroundImage: NetworkImage(delivery.senderImage),
+                          ),
+                        ),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(5, 45, 0, 0),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      "ชื่อ: ${delivery.receiverName}",
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text("เบอร์โทร: ${delivery.senderPhone}"),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  Positioned(
+                    top: 10,
+                    right: 10,
+                    child: Text(
+                      _getStatusText(status),
+                      style: TextStyle(
+                        color: _getStatusColor(status),
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
 
   Widget _buildProfileSection() {
     return Column(
